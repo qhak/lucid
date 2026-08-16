@@ -1,0 +1,1572 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Lucid Analytics</title>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="icon" type="image/svg+xml" href="/lucid-mark.svg">
+<script>
+// Apply the saved theme before the page paints.
+(() => {
+  let theme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  try { const saved = localStorage.getItem('lucid-theme'); if (saved === 'dark' || saved === 'light') theme = saved; } catch {}
+  document.documentElement.dataset.theme = theme;
+})();
+</script>
+<link rel="stylesheet" href="/dashboard.css">
+<link rel="stylesheet" href="/personal-ui.css">
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <button class="brand" id="homebtn" aria-label="Lucid Analytics home"><img class="mark" src="/lucid-mark.svg" alt=""><span class="brand-name">Lucid Analytics</span></button>
+    <div style="display:flex;gap:4px">
+      <button class="theme-toggle" id="themebtn" type="button" aria-label="Switch theme"></button>
+      <button class="navlink" id="excludedbtn">Excluded Places</button>
+    </div>
+  </div>
+  <div id="view"></div>
+</div>
+
+<div class="overlay" id="modal"></div>
+
+<script src="/world-data.js"></script>
+<script src="/preview-sites.js"></script>
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const fmt = (n) => (n ?? 0).toLocaleString();
+const money = (minor, currency = "USD", decimals = 2) => {
+  try { return new Intl.NumberFormat(undefined, { style: "currency", currency, minimumFractionDigits: decimals, maximumFractionDigits: decimals }).format((minor || 0) / 100); }
+  catch { return currency + " " + ((minor || 0) / 100).toFixed(decimals); }
+};
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+const themeColor = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const accA = (a) => 'rgba(' + themeColor('--accent-rgb') + ',' + a + ')';
+function updateThemeButton() {
+  const dark = document.documentElement.dataset.theme === 'dark';
+  $('themebtn').innerHTML = dark
+    ? '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/></svg><span>Light</span>'
+    : '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M20 14a8 8 0 0 1-10-10 8 8 0 1 0 10 10Z"/></svg><span>Dark</span>';
+  $('themebtn').setAttribute('aria-label', 'Switch to ' + (dark ? 'light' : 'dark') + ' theme');
+  $('themebtn').title = 'Switch to ' + (dark ? 'light' : 'dark') + ' theme';
+}
+function setTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  try { localStorage.setItem('lucid-theme', theme); } catch {}
+  updateThemeButton();
+  if (state.site && state.data) { renderChart(); drawMap(); }
+  else if ($('cards')) {
+    const query = $('sitesearch')?.value.trim().toLowerCase() || '';
+    renderCards(state.sitesList.filter(site => site.domain.includes(query)));
+  }
+}
+$('themebtn').addEventListener('click', () => setTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'));
+window.addEventListener('storage', e => { if (e.key === 'lucid-theme' && (e.newValue === 'light' || e.newValue === 'dark')) setTheme(e.newValue); });
+updateThemeButton();
+
+/* ================= state & routing ================= */
+
+const state = {
+  sitesList: [],
+  site: null,
+  range: null,          // {key,label,from,to}
+  filters: [],
+  metric: "visitors",
+  data: null,
+  journeyStart: null,
+};
+
+const RANGES = [
+  { key: "day",   label: "Today",          kbd: "D" },
+  { key: "yday",  label: "Yesterday",      kbd: "E" },
+  { key: "24h",   label: "Last 24 Hours",  kbd: "H" },
+  { key: "7d",    label: "Last 7 Days",    kbd: "W" },
+  { key: "28d",   label: "Last 28 Days",   kbd: "F" },
+  { key: "91d",   label: "Last 91 Days",   kbd: "N" },
+  { key: "180d",  label: "Last 180 Days",  kbd: "" },
+  { key: "365d",  label: "Last 365 Days",  kbd: "" },
+  { key: "mtd",   label: "Month to Date",  kbd: "M" },
+  { key: "lastm", label: "Last Month",     kbd: "P" },
+  { key: "ytd",   label: "Year to Date",   kbd: "Y" },
+  { key: "12mo",  label: "Last 12 Months", kbd: "L" },
+  { key: "all",   label: "All time",       kbd: "A" },
+  { key: "custom",label: "Custom Range",   kbd: "C" },
+];
+
+function rangeFor(key, customFrom, customTo) {
+  const now = Math.floor(Date.now() / 1000);
+  const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
+  const mid = Math.floor(midnight.getTime() / 1000);
+  const d = new Date();
+  const def = RANGES.find((r) => r.key === key) || RANGES[4];
+  let from, to = now, label = def.label;
+
+  switch (key) {
+    case "day":   from = mid; break;
+    case "yday":  from = mid - 86400; to = mid; break;
+    case "24h":   from = now - 86400; break;
+    case "7d":    from = now - 7 * 86400; break;
+    case "91d":   from = now - 91 * 86400; break;
+    case "180d":  from = now - 180 * 86400; break;
+    case "365d":  from = now - 365 * 86400; break;
+    case "mtd":   from = Math.floor(new Date(d.getFullYear(), d.getMonth(), 1).getTime() / 1000); break;
+    case "lastm": {
+      from = Math.floor(new Date(d.getFullYear(), d.getMonth() - 1, 1).getTime() / 1000);
+      to = Math.floor(new Date(d.getFullYear(), d.getMonth(), 1).getTime() / 1000);
+      break;
+    }
+    case "ytd":   from = Math.floor(new Date(d.getFullYear(), 0, 1).getTime() / 1000); break;
+    case "12mo":  from = now - 365 * 86400; break;
+    case "all":   from = 0; break;
+    case "custom":
+      from = customFrom; to = customTo;
+      label = new Date(from * 1000).toLocaleDateString(undefined, { day: "numeric", month: "short" }) +
+              " – " + new Date((to - 1) * 1000).toLocaleDateString(undefined, { day: "numeric", month: "short" });
+      break;
+    default:      from = now - 28 * 86400; break;
+  }
+  return { key, label, from, to };
+}
+state.range = rangeFor("28d");
+
+function route() {
+  stopPoll();
+  const hash = decodeURIComponent(location.hash.replace(/^#\/?/, ""));
+  if (hash) { state.site = hash; showDashboard(); }
+  else { state.site = null; showSites(); }
+}
+window.addEventListener("hashchange", route);
+$("homebtn").addEventListener("click", () => { location.hash = "/"; });
+$("excludedbtn").addEventListener("click", () => { excludedModal(); });
+
+/* ================= sites index ================= */
+
+async function fetchSites() {
+  const res = await fetch("/api/sites");
+  if (!res.ok) throw new Error("Could not load sites (" + res.status + ")");
+  const { sites } = await res.json();
+  state.sitesList = sites.concat(previewCards());
+  return state.sitesList;
+}
+
+async function showSites() {
+  const host = $("view");
+  host.innerHTML = '<div class="sites-head"><div class="eyebrow">Your workspace</div><h1>Websites</h1><p>A clear view of the people visiting your websites.</p></div><div class="empty">Loading…</div>';
+  let sites;
+  try { sites = await fetchSites(); }
+  catch (e) { host.innerHTML = '<div class="errbox">' + esc(e.message) + "</div>"; return; }
+
+  host.innerHTML = `
+    <div class="sites-head"><div class="eyebrow">Your workspace</div><h1>Websites</h1><p>A clear view of the people visiting your websites.</p></div>
+    <div class="sites-toolbar">
+      <input class="searchbox" id="sitesearch" aria-label="Search websites" placeholder="Search websites…">
+      <div class="toolbar-right">
+        <span class="liveind" title="Refreshes automatically every 30 seconds"><span class="dot"></span><span id="liveago">Live</span></span>
+        <button class="btn primary" id="addsite">Add website</button>
+        <button class="btn" id="addpreview">Add preview site</button>
+      </div>
+    </div>
+    <div class="cards" id="cards"></div>
+    <p class="note">Visitors in the last 24 hours, compared with the 24 hours before.</p>`;
+
+  renderCards(sites);
+  markUpdated();
+  $("sitesearch").addEventListener("input", (e) => {
+    const q = e.target.value.trim().toLowerCase();
+    renderCards(sites.filter((s) => s.domain.includes(q)));
+  });
+  $("addsite").addEventListener("click", () => addSiteModal());
+  $("addpreview").addEventListener("click", () => previewSiteModal());
+
+  startPoll(async () => {
+    sites = await fetchSites().catch(() => sites);
+    const q = ($("sitesearch") && $("sitesearch").value.trim().toLowerCase()) || "";
+    renderCards(q ? sites.filter((s) => s.domain.includes(q)) : sites);
+    markUpdated();
+  });
+}
+
+function renderCards(sites) {
+  const host = $("cards");
+  if (!sites.length) {
+    host.innerHTML = $('sitesearch')?.value.trim() ? '<div class="empty">No websites match your search.</div>' : '<div class="onboarding"><div class="onboarding-icon"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M7 16v-3m5 3V8m5 8v-5"/></svg></div><h2>Your first website starts here</h2><p>Add your website and install a small tracking script to see where visitors come from and what they do.</p><button class="btn primary" id="firstsite">Add your first website</button><div class="setup-steps"><span><b>1</b>Add a domain</span><span><b>2</b>Install the script</span><span><b>3</b>See your traffic</span></div></div>'; $('firstsite')?.addEventListener('click', addSiteModal);
+    return;
+  }
+  host.innerHTML = sites.map((s, i) => {
+    const cls = s.delta > 0 ? "up" : s.delta < 0 ? "down" : "flat";
+    const arrow = s.delta > 0 ? "↗" : s.delta < 0 ? "↘" : "—";
+    const dtext = s.delta === 0 ? "" : Math.abs(s.delta) + "%";
+    return `
+    <div class="sitecard" data-d="${esc(s.previewId ? 'preview:' + s.previewId : s.domain)}">
+      <div class="row1">
+        <span class="domain">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+          ${esc(s.domain)}
+        </span>
+        ${s.previewId ? '<span class="preview-badge">Preview</span>' : ''}<button class="dots" data-menu="${i}">⋮</button>
+      </div>
+      <canvas data-spark="${i}" width="300" height="52"></canvas>
+      <div class="row2">
+        <div><div class="big tabular">${fmt(s.visitors24h)}</div>
+        <div class="lbl">${s.previewId ? 'simulated visitors' : (s.visitors24h === 1 ? "visitor" : "visitors") + ' in last 24h'}</div></div>
+        <span class="badge ${cls}">${arrow} ${dtext}</span>
+      </div>
+    </div>`;
+  }).join("");
+
+  host.querySelectorAll(".sitecard").forEach((card) =>
+    card.addEventListener("click", (e) => {
+      if (e.target.closest(".dots") || e.target.closest(".cardmenu")) return;
+      location.hash = "/" + card.dataset.d;
+    })
+  );
+  host.querySelectorAll("[data-menu]").forEach((btn) =>
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      closeMenus();
+      const i = +btn.dataset.menu;
+      const site = sites[i];
+      if (site.previewId) { previewCardMenu(btn, site); return; }
+      const menu = document.createElement("div");
+      menu.className = "cardmenu";
+      menu.innerHTML = `
+        <button data-a="open">Open dashboard</button>
+        <button data-a="snippet">Copy embed snippet</button>
+        <button data-a="remove" class="danger">Remove site</button>`;
+      btn.closest(".sitecard").appendChild(menu);
+      menu.addEventListener("click", async (ev) => {
+        ev.stopPropagation();
+        const a = ev.target.dataset.a;
+        if (a === "open") location.hash = "/" + site.domain;
+        if (a === "snippet") {
+          await navigator.clipboard.writeText(snippetFor(site.domain));
+          ev.target.textContent = "Copied!";
+          setTimeout(closeMenus, 700);
+        }
+        if (a === "remove") {
+          if (confirm("Remove " + site.domain + "? Collected data is kept, but new events stop.")) {
+            await fetch("/api/sites?domain=" + encodeURIComponent(site.domain), { method: "DELETE" });
+            showSites();
+          }
+        }
+      });
+    })
+  );
+  sites.forEach((s, i) => drawSpark(host.querySelector('[data-spark="' + i + '"]'), s.spark));
+}
+
+function snippetFor(domain) {
+  return '<script defer src="' + location.origin + '/tracker.js"><' + '/script> <!-- ' + domain + ' -->';
+}
+
+function drawSpark(canvas, spark) {
+  if (!canvas) return;
+  const ratio = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth || 300, h = 52;
+  canvas.width = w * ratio; canvas.height = h * ratio;
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+
+  // Fill all 24 hourly buckets so the line spans the full card width.
+  const byHour = Object.fromEntries((spark || []).map((p) => [p.t, p.v]));
+  const values = [];
+  const now = Date.now();
+  for (let i = 23; i >= 0; i--) {
+    // matches the SQL bucket format: strftime('%Y-%m-%dT%H')
+    const key = new Date(now - i * 3600_000).toISOString().slice(0, 13);
+    values.push(byHour[key] || 0);
+  }
+  const max = Math.max(1, ...values);
+  const x = (i) => (w / 23) * i;
+  const y = (v) => h - 6 - (v / max) * (h - 12);
+
+  const grad = ctx.createLinearGradient(0, 0, 0, h);
+  grad.addColorStop(0, accA(.12));
+  grad.addColorStop(1, accA(0));
+  ctx.beginPath();
+  ctx.moveTo(0, h);
+  values.forEach((v, i) => ctx.lineTo(x(i), y(v)));
+  ctx.lineTo(w, h);
+  ctx.closePath();
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  ctx.beginPath();
+  values.forEach((v, i) => (i ? ctx.lineTo(x(i), y(v)) : ctx.moveTo(x(i), y(v))));
+  ctx.strokeStyle = themeColor("--accent");
+  ctx.lineWidth = 1.8;
+  ctx.lineJoin = "round";
+  ctx.stroke();
+}
+
+function closeMenus() {
+  document.querySelectorAll(".cardmenu,.sitemenu,.datemenu,.filtermenu").forEach((m) => m.remove());
+}
+document.addEventListener("click", (e) => {
+  if (!e.target.closest(".cardmenu,.sitemenu,.datemenu,.filtermenu,[data-menu],#sitepick,#datebtn,#filterbtn")) closeMenus();
+});
+
+/* ---- add site modal ---- */
+
+function addSiteModal() {
+  const m = $("modal");
+  m.classList.add("open");
+  m.innerHTML = `
+    <div class="modal">
+      <h3>Add a website</h3>
+      <p>Enter the domain you want to track, without https:// or www.</p>
+      <div class="err" id="adderr" style="display:none"></div>
+      <input class="domain" id="adddomain" placeholder="example.com" autofocus>
+      <div class="actions">
+        <button class="btn" id="canceladd">Cancel</button>
+        <button class="btn primary" id="confirmadd">Add website</button>
+      </div>
+    </div>`;
+  $("canceladd").addEventListener("click", closeModal);
+  $("adddomain").addEventListener("keydown", (e) => { if (e.key === "Enter") $("confirmadd").click(); });
+  $("confirmadd").addEventListener("click", async () => {
+    const domain = $("adddomain").value;
+    const res = await fetch("/api/sites", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ domain }),
+    });
+    const out = await res.json();
+    if (!res.ok) {
+      $("adderr").style.display = "block";
+      $("adderr").textContent = out.error || "Something went wrong.";
+      return;
+    }
+    snippetModal(out.domain);
+  });
+}
+
+function snippetModal(domain) {
+  const m = $("modal");
+  m.classList.add("open");
+  const snip = snippetFor(domain);
+  m.innerHTML = `
+    <div class="modal">
+      <h3>${esc(domain)} added</h3>
+      <p>Paste this into the &lt;head&gt; of the site. Events start appearing as soon as a page loads with it.</p>
+      <div class="snippet" id="snip">${esc(snip)}</div>
+      <div class="actions">
+        <button class="btn" id="copysnip">Copy snippet</button>
+        <button class="btn primary" id="donesnip">Done</button>
+      </div>
+    </div>`;
+  $("copysnip").addEventListener("click", async (e) => {
+    await navigator.clipboard.writeText(snip);
+    e.target.textContent = "Copied!";
+  });
+  $("donesnip").addEventListener("click", () => { closeModal(); showSites(); });
+}
+
+function closeModal() {
+  $("modal").classList.remove("open");
+  $("modal").innerHTML = "";
+}
+$("modal").addEventListener("click", (e) => { if (e.target === $("modal")) closeModal(); });
+
+/* ---- excluded places modal (account-wide — applies to every site) ---- */
+
+async function excludedModal() {
+  const m = $("modal");
+  m.classList.add("open");
+  m.innerHTML = `
+    <div class="modal">
+      <h3>Excluded places</h3>
+      <p>Anyone connecting from a country, region, or city on this list is never tracked —
+         dropped before the event is written, on every site. Takes effect within 60 seconds,
+         no redeploy needed.</p>
+      <div class="err" id="exclerr" style="display:none"></div>
+      <div class="places" id="places"><div class="empty">Loading…</div></div>
+      <div class="frow" style="margin-top:14px">
+        <input class="domain" id="newplace" placeholder="e.g. Lombardy, Spain, Brescia" style="margin-bottom:0">
+        <button class="btn primary" id="addplace">Add</button>
+      </div>
+      <div class="actions"><button class="btn" id="exclclose">Done</button></div>
+    </div>`;
+  $("exclclose").addEventListener("click", closeModal);
+  $("newplace").addEventListener("keydown", (e) => { if (e.key === "Enter") $("addplace").click(); });
+  $("addplace").addEventListener("click", async () => {
+    const place = $("newplace").value.trim();
+    if (!place) return;
+    const res = await fetch("/api/excluded", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ place }),
+    });
+    const out = await res.json();
+    if (!res.ok) {
+      $("exclerr").style.display = "block";
+      $("exclerr").textContent = out.error || "Something went wrong.";
+      return;
+    }
+    $("exclerr").style.display = "none";
+    $("newplace").value = "";
+    loadPlaces();
+  });
+  await loadPlaces();
+
+  async function loadPlaces() {
+    const res = await fetch("/api/excluded");
+    const { places } = await res.json();
+    const host = $("places");
+    if (!host) return;
+    if (!places.length) {
+      host.innerHTML = '<div class="empty">Nothing excluded — every visitor everywhere is being tracked.</div>';
+      return;
+    }
+    host.innerHTML = places.map((p) =>
+      '<span class="fpill"><span class="ftext">' + esc(p) + '</span><button data-p="' + esc(p) + '">&times;</button></span>'
+    ).join("");
+    host.querySelectorAll("[data-p]").forEach((b) =>
+      b.addEventListener("click", async () => {
+        await fetch("/api/excluded?place=" + encodeURIComponent(b.dataset.p), { method: "DELETE" });
+        loadPlaces();
+      }));
+  }
+}
+
+/* ================= dashboard ================= */
+
+const FIELD_OF = {
+  channels: "channel", sources: "ref_domain", campaigns: "utm_campaign",
+  pages: "path", entry: "path", exit: "path",
+  countries: "country", regions: "region", cities: "city",
+  browsers: "browser", os: "os", devices: "device", screens: "screen",
+  visitorTypes: "visitor_type", networks: "network",
+  languages: "language", timezones: "timezone",
+};
+const active = { acq: "channels", pages: "pages", geo: "map", tech: "browsers", who: "visitorTypes", ev: "goals" };
+
+function showDashboard() {
+  const host = $("view");
+  host.innerHTML = `
+    <div class="dashbar">
+      <div class="dash-left">
+        <button class="sitepick" id="sitepick">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+          <span id="sitename"></span><span class="chev">▾</span>
+        </button>
+        <span class="liveind" title="Dashboard refreshes every 30 seconds"><span class="dot"></span><span id="liveago">Live</span></span>
+        <div class="filters" id="filters"></div>
+      </div>
+      <div class="dash-right">
+        <button class="datebtn settings-btn" id="revenuesettings" type="button" aria-label="Revenue settings" title="Revenue settings">⚙ <span>Settings</span></button>
+        <button class="datebtn" id="filterbtn">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 3H2l8 9.46V19l4 2v-8.54L22 3z"/></svg>
+          <span>Filter</span>
+        </button>
+        <button class="datebtn" id="datebtn">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>
+          <span id="datelabel"></span>
+        </button>
+      </div>
+    </div>
+    <div id="error"></div>
+    <section class="overview" aria-label="Traffic overview"><div class="stats" id="stats"></div>
+    <div class="chartcard"><div class="chart-title"><strong id="chartmetric">Unique visitors</strong><span>Times shown in UTC</span></div><canvas id="chart" aria-label="Traffic over time" role="img"></canvas><div id="charttooltip" class="chart-tooltip" hidden></div></div></section>
+    <div class="grid">
+      <div class="panel">
+        <h2 class="panel-heading">Sources</h2>
+        <div class="tabs" data-group="acq">
+          <button class="on" data-key="channels">Channels</button>
+          <button data-key="sources">Sources</button>
+          <button data-key="campaigns">Campaigns</button>
+        </div>
+        <div id="acq"></div>
+      </div>
+      <div class="panel">
+        <h2 class="panel-heading">Pages</h2>
+        <div class="tabs" data-group="pages">
+          <button class="on" data-key="pages">Top Pages</button>
+          <button data-key="entry">Entry Pages</button>
+          <button data-key="exit">Exit Pages</button>
+        </div>
+        <div id="pages"></div>
+      </div>
+      <div class="panel">
+        <h2 class="panel-heading">Locations</h2>
+        <div class="tabs" data-group="geo">
+          <button class="on" data-key="map">Map</button>
+          <button data-key="countries">Countries</button>
+          <button data-key="regions">Regions</button>
+          <button data-key="cities">Cities</button>
+        </div>
+        <div id="geo"></div>
+      </div>
+      <div class="panel">
+        <h2 class="panel-heading">Devices</h2>
+        <div class="tabs" data-group="tech">
+          <button class="on" data-key="browsers">Browsers</button>
+          <button data-key="os">Operating Systems</button>
+          <button data-key="devices">Devices</button>
+          <button data-key="screens">Screen Size</button>
+        </div>
+        <div id="tech"></div>
+      </div>
+      <div class="panel wide">
+        <h2 class="panel-heading">Audience</h2>
+        <div class="tabs" data-group="who">
+          <button class="on" data-key="visitorTypes">New vs Returning</button>
+          <button data-key="networks">Networks</button>
+          <button data-key="languages">Languages</button>
+          <button data-key="timezones">Timezones</button>
+        </div>
+        <div id="who"></div>
+      </div>
+      <div class="panel wide">
+        <h2 class="panel-heading">Conversions & journeys</h2>
+        <div class="tabs" data-group="ev">
+          <button class="on" data-key="goals">Goals</button>
+          <button data-key="explore">Explore</button>
+          <button data-key="visits">Visits</button>
+          <button data-key="events">Events</button>
+        </div>
+        <div id="ev"></div>
+      </div>
+    </div>
+    <p class="quality-note" id="qualitynote"></p>
+    <button class="btn" id="automationbtn" type="button">Review automated visits</button>
+    <p class="note dashboard-note">Cookieless analytics. Unique visitor identities reset daily at midnight UTC.</p>`;
+
+  const preview = currentPreview();
+  $("sitename").textContent = preview ? preview.domain : state.site;
+  if (preview) {
+    const banner = document.createElement('div');
+    banner.className = 'preview-banner';
+    banner.innerHTML = '<span><b>Preview site</b> · Simulated totals for the selected period. Saved in this browser.</span><button class="btn" id="editpreview">Edit numbers</button>';
+    host.prepend(banner);
+    $('editpreview').addEventListener('click', () => previewSiteModal(preview.id));
+    $('revenuesettings').hidden = true;
+    $('filterbtn').hidden = true;
+    $('liveago').parentElement.hidden = true;
+    $('qualitynote').hidden = true;
+    $('automationbtn').hidden = true;
+    host.querySelector('.dashboard-note').textContent = 'Preview data only. This website does not collect visits.';
+  }
+  $("datelabel").textContent = state.range.label;
+  $("sitepick").addEventListener("click", (e) => { e.stopPropagation(); siteMenu(); });
+  $("revenuesettings").addEventListener("click", revenueSettingsModal);
+  $('automationbtn').addEventListener('click', automationModal);
+  $("datebtn").addEventListener("click", (e) => { e.stopPropagation(); dateMenu(); });
+  $("filterbtn").addEventListener("click", (e) => { e.stopPropagation(); filterMenu(); });
+
+  document.querySelectorAll(".tabs").forEach((bar) =>
+    bar.addEventListener("click", (e) => {
+      const btn = e.target.closest("button");
+      if (!btn) return;
+      if (!btn.dataset.key) return;
+      active[bar.dataset.group] = btn.dataset.key;
+      bar.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b === btn));
+      renderPanel(bar.dataset.group);
+    })
+  );
+
+  document.querySelectorAll('.tabs[data-group]').forEach(bar => {
+    const group = bar.dataset.group;
+    if (group === 'ev') return;
+    const button = document.createElement('button');
+    button.className = 'expand-report'; button.type = 'button';
+    button.setAttribute('aria-label', 'Expand ' + ({acq:'sources',pages:'pages',geo:'locations',tech:'devices',who:'audience'})[group] + ' report');
+    button.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/></svg>';
+    button.addEventListener('click', event => { event.stopPropagation(); expandReport(group); });
+    bar.appendChild(button);
+  });
+  if (!state.sitesList.length) fetchSites().catch(() => {});
+  resetAndLoad();
+  if (!preview) startPoll(load);
+}
+
+function siteMenu() {
+  closeMenus();
+  const menu = document.createElement("div");
+  menu.className = "sitemenu";
+  menu.innerHTML =
+    '<button class="back" data-d="">← Back to all sites</button>' +
+    state.sitesList.map((s) =>
+      '<button data-d="' + esc(s.previewId ? 'preview:' + s.previewId : s.domain) + '">' + esc(s.domain) + (s.previewId ? ' · Preview' : '') +
+      (s.domain === state.site ? " ✓" : "") + "</button>").join("");
+  $("sitepick").parentElement.appendChild(menu);
+  menu.addEventListener("click", (e) => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    closeMenus();
+    location.hash = "/" + b.dataset.d;
+  });
+}
+
+function dateMenu() {
+  closeMenus();
+  const menu = document.createElement("div");
+  menu.className = "datemenu";
+  const groups = [["day","yday","24h"], ["7d","28d","91d","180d","365d"], ["mtd","lastm"], ["ytd","12mo"], ["all","custom"]];
+  menu.innerHTML = groups.map((g) =>
+    g.map((key) => {
+      const r = RANGES.find((x) => x.key === key);
+      return '<button data-k="' + key + '"' + (state.range.key === key ? ' class="on"' : "") + ">" +
+        "<span>" + r.label + "</span>" + (r.kbd ? "<kbd>" + r.kbd + "</kbd>" : "") + "</button>";
+    }).join("")
+  ).join('<div class="sep"></div>') + `
+    <div class="customrange" id="customrange">
+      <input type="date" id="cfrom"><input type="date" id="cto">
+      <button class="btn primary" id="applycustom">Apply</button>
+    </div>`;
+  $("datebtn").parentElement.appendChild(menu);
+  menu.addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-k]");
+    if (!b) return;
+    if (b.dataset.k === "custom") {
+      $("customrange").classList.add("open");
+      return;
+    }
+    setRange(rangeFor(b.dataset.k));
+  });
+  const apply = menu.querySelector("#applycustom");
+  if (apply) apply.addEventListener("click", () => {
+    const f = menu.querySelector("#cfrom").value, t = menu.querySelector("#cto").value;
+    if (!f || !t) return;
+    const from = Math.floor(new Date(f + "T00:00:00").getTime() / 1000);
+    const to = Math.floor(new Date(t + "T00:00:00").getTime() / 1000) + 86400;
+    if (to <= from) return;
+    setRange(rangeFor("custom", from, to));
+  });
+}
+
+function setRange(r) {
+  state.range = r;
+  closeMenus();
+  const el = $("datelabel");
+  if (el) el.textContent = r.label;
+  resetAndLoad();
+}
+
+// Plausible-style keyboard shortcuts.
+document.addEventListener("keydown", (e) => {
+  if (!state.site || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (/INPUT|SELECT|TEXTAREA/.test(e.target.tagName)) return;
+  const r = RANGES.find((x) => x.kbd.toLowerCase() === e.key.toLowerCase());
+  if (!r) return;
+  if (r.key === "custom") { dateMenu(); const c = $("customrange"); if (c) c.classList.add("open"); return; }
+  setRange(rangeFor(r.key));
+});
+
+/* ---- filters ---- */
+
+const FIELD_LABEL = {
+  path: "Page", channel: "Channel", ref_domain: "Source",
+  utm_source: "UTM source", utm_medium: "UTM medium", utm_campaign: "UTM campaign",
+  country: "Country", region: "Region", city: "City", timezone: "Timezone",
+  browser: "Browser", os: "Operating system", device: "Device type",
+  screen: "Screen size", network: "Network", language: "Language",
+  visitor_type: "Visitor", name: "Goal",
+};
+const KIND_OF_FIELD = {
+  path: "page", channel: "channel", ref_domain: "source",
+  utm_source: "utm", utm_medium: "utm", utm_campaign: "utm",
+  country: "location", region: "location", city: "location", timezone: "location",
+  browser: "browser", os: "os", device: "device", screen: "screen",
+  network: "network", language: "language", visitor_type: "visitor", name: "goal",
+};
+const FILTER_KINDS = {
+  page:     { title: "Filter by Page", fields: ["path"] },
+  channel:  { title: "Filter by Channel", fields: ["channel"] },
+  source:   { title: "Filter by Source", fields: ["ref_domain"] },
+  utm:      { title: "Filter by UTM tags", fields: ["utm_source", "utm_medium", "utm_campaign"] },
+  location: { title: "Filter by Location", fields: ["country", "region", "city", "timezone"] },
+  browser:  { title: "Filter by Browser", fields: ["browser"] },
+  os:       { title: "Filter by Operating system", fields: ["os"] },
+  device:   { title: "Filter by Device type", fields: ["device"] },
+  screen:   { title: "Filter by Screen size", fields: ["screen"] },
+  network:  { title: "Filter by Network", fields: ["network"] },
+  language: { title: "Filter by Language", fields: ["language"] },
+  visitor:  { title: "Filter by New or returning", fields: ["visitor_type"] },
+  goal:     { title: "Filter by Goal", fields: ["name"] },
+};
+
+function suggestionsFor(field) {
+  const d = state.data || {};
+  const src = {
+    path: d.pages, channel: d.channels, ref_domain: d.sources,
+    utm_campaign: d.campaigns, country: d.countries, region: d.regions, city: d.cities,
+    browser: d.browsers, os: d.os, device: d.devices,
+    timezone: d.timezones, network: d.networks, language: d.languages,
+    screen: d.screens, visitor_type: d.visitorTypes,
+    name: (d.goals || []).map((g) => ({ k: g.k, v: g.visitors })),
+  }[field];
+  return src || [];
+}
+const dispValue = (field, v) => field === "country" ? countryName(v) : String(v);
+
+function filterMenu() {
+  closeMenus();
+  const menu = document.createElement("div");
+  menu.className = "filtermenu";
+  menu.innerHTML = `
+    <div class="fcol">
+      <h5>URL</h5>
+      <button data-k="page">Page</button>
+      <h5>Acquisition</h5>
+      <button data-k="channel">Channel</button>
+      <button data-k="source">Source</button>
+      <button data-k="utm">UTM tags</button>
+    </div>
+    <div class="fcol">
+      <h5>Person</h5>
+      <button data-k="location">Location</button>
+      <button data-k="browser">Browser</button>
+      <button data-k="os">Operating system</button>
+      <button data-k="device">Device type</button>
+      <button data-k="screen">Screen size</button>
+      <button data-k="network">Network</button>
+      <button data-k="language">Language</button>
+      <h5>Behaviour</h5>
+      <button data-k="visitor">New or returning</button>
+      <button data-k="goal">Goal</button>
+    </div>`;
+  $("filterbtn").parentElement.appendChild(menu);
+  menu.addEventListener("click", (e) => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    closeMenus();
+    filterModal(b.dataset.k);
+  });
+}
+
+function filterModal(kind) {
+  const def = FILTER_KINDS[kind];
+  if (!def) return;
+  const m = $("modal");
+  m.classList.add("open");
+  m.innerHTML = `
+    <div class="modal widem">
+      <h3>${def.title}</h3>
+      <p>Values on the same field combine with "or"; different fields combine with "and".</p>
+      <div id="ffields"></div>
+      <div class="actions">
+        <button class="btn" id="fclear">Remove filter</button>
+        <button class="btn primary" id="fapply">Apply filter</button>
+      </div>
+    </div>`;
+  const host = $("ffields");
+  for (const field of def.fields) {
+    const existing = state.filters.find((x) => x.field === field);
+    const values = existing ? [].concat(existing.value) : [];
+    const op = existing && existing.op === "is_not" ? "is_not" : "is";
+    const el = document.createElement("div");
+    el.className = "ffield";
+    el.dataset.field = field;
+    el.innerHTML = `
+      <label>${FIELD_LABEL[field]}</label>
+      <div class="frow">
+        <select class="fop">
+          <option value="is"${op === "is" ? " selected" : ""}>is</option>
+          <option value="is_not"${op === "is_not" ? " selected" : ""}>is not</option>
+        </select>
+        <div class="fchips">
+          <input class="fchipinput" placeholder="Select a ${FIELD_LABEL[field]}">
+          <div class="fsuggest"></div>
+        </div>
+      </div>`;
+    host.appendChild(el);
+    const chips = el.querySelector(".fchips");
+    for (const v of values) addChip(chips, field, v);
+    wireChips(el, field);
+  }
+  $("fapply").addEventListener("click", () => applyFilterModal(def));
+  $("fclear").addEventListener("click", () => {
+    state.filters = state.filters.filter((f) => !def.fields.includes(f.field));
+    closeModal();
+    resetAndLoad();
+  });
+}
+
+function addChip(chips, field, value) {
+  const input = chips.querySelector(".fchipinput");
+  const span = document.createElement("span");
+  span.className = "chip";
+  span.dataset.v = value;
+  span.innerHTML = esc(dispValue(field, value)) + " <button>×</button>";
+  span.querySelector("button").addEventListener("click", () => span.remove());
+  chips.insertBefore(span, input);
+}
+
+function wireChips(el, field) {
+  const chips = el.querySelector(".fchips");
+  const input = chips.querySelector(".fchipinput");
+  const sug = chips.querySelector(".fsuggest");
+  const chosen = () => [...chips.querySelectorAll(".chip")].map((c) => c.dataset.v);
+  const refresh = () => {
+    const q = input.value.trim().toLowerCase();
+    const opts = suggestionsFor(field).filter((o) =>
+      !chosen().includes(String(o.k)) &&
+      (!q || String(o.k).toLowerCase().includes(q) || dispValue(field, o.k).toLowerCase().includes(q))
+    ).slice(0, 8);
+    sug.innerHTML = opts.map((o) =>
+      '<button data-v="' + esc(o.k) + '"><span>' + esc(dispValue(field, o.k)) +
+      '</span><span class="n">' + fmt(o.v) + "</span></button>").join("");
+    sug.classList.toggle("open", !!opts.length);
+  };
+  input.addEventListener("focus", refresh);
+  input.addEventListener("input", refresh);
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && input.value.trim()) {
+      addChip(chips, field, input.value.trim());
+      input.value = "";
+      refresh();
+      e.preventDefault();
+    }
+    if (e.key === "Backspace" && !input.value) {
+      const last = chips.querySelector(".chip:last-of-type");
+      if (last) last.remove();
+      refresh();
+    }
+  });
+  sug.addEventListener("mousedown", (e) => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    e.preventDefault();
+    addChip(chips, field, b.dataset.v);
+    input.value = "";
+    refresh();
+  });
+  input.addEventListener("blur", () => setTimeout(() => sug.classList.remove("open"), 150));
+  chips.addEventListener("click", () => input.focus());
+}
+
+function applyFilterModal(def) {
+  for (const field of def.fields) {
+    const el = document.querySelector('.ffield[data-field="' + field + '"]');
+    if (!el) continue;
+    const values = [...el.querySelectorAll(".chip")].map((c) => c.dataset.v);
+    const op = el.querySelector(".fop").value;
+    state.filters = state.filters.filter((f) => f.field !== field);
+    if (values.length) state.filters.push({ field, op, value: values });
+  }
+  closeModal();
+  resetAndLoad();
+}
+
+/* ---- data ---- */
+
+// journeyStart is deliberately NOT reset in here — a background auto-refresh
+// re-runs this every 30s, and resetting it there would yank the user out of
+// whatever journey they're looking at. It's reset explicitly wherever the
+// site, range or filters actually change (see resetAndLoad below).
+async function load() {
+  if (!state.site) return;
+  if (state.site.startsWith('preview:')) {
+    const preview = currentPreview();
+    if (!preview) { location.hash = '/'; return; }
+    state.filters = [];
+    state.data = previewStats(preview);
+    render();
+    return;
+  }
+  $("error").innerHTML = "";
+  const params = new URLSearchParams({
+    site: state.site,
+    from: state.range.from,
+    to: state.range.to,
+    filters: JSON.stringify(state.filters),
+  });
+  const res = await fetch("/api/stats?" + params);
+  if (!res.ok) {
+    $("error").innerHTML = '<div class="errbox">Query failed (' + res.status + ").</div>";
+    return;
+  }
+  state.data = await res.json();
+  render();
+  markUpdated();
+}
+
+function resetAndLoad() {
+  state.journeyStart = null;
+  load();
+}
+
+/* ---- auto-refresh: dashboard polls for new events while it's open ---- */
+
+const POLL_MS = 30_000;
+let pollTimer = null;
+
+function pollBlocked() {
+  return document.hidden || $("modal").classList.contains("open") ||
+    document.querySelector(".cardmenu,.sitemenu,.datemenu,.filtermenu");
+}
+
+function startPoll(fn) {
+  stopPoll();
+  pollTimer = setInterval(() => { if (!pollBlocked()) fn(); }, POLL_MS);
+}
+function stopPoll() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+}
+
+let lastUpdate = 0;
+function markUpdated() {
+  lastUpdate = Date.now();
+  tickLiveLabel();
+}
+function tickLiveLabel() {
+  const el = $("liveago");
+  if (!el) return;
+  const s = Math.round((Date.now() - lastUpdate) / 1000);
+  el.textContent = s < 3 ? "Updated just now" : "Updated " + (s < 60 ? s + "s ago" : Math.floor(s / 60) + "m ago");
+}
+setInterval(tickLiveLabel, 1000);
+
+function render() {
+  if ($('qualitynote')) {
+    const q=state.data.quality || {};
+    $('qualitynote').textContent=fmt(q.likelyAutomatedSessions || 0)+' likely automated · '+fmt(q.knownBotSessions || 0)+' known bots · '+fmt(q.shortUnqualifiedSessions || 0)+' short unqualified visits excluded';
+    $('qualitynote').title='Site-wide counts for this period, before report filters. Likely automated visits match reviewed network and behaviour rules; this is not proof. Short visits have not reached 2 visible seconds or a second page. Raw events are retained.';
+  }
+  renderFilters();
+  renderStats();
+  renderChart();
+  for (const g of Object.keys(active)) renderPanel(g);
+}
+
+function renderFilters() {
+  const host = $("filters");
+  if (!host) return;
+  host.innerHTML = state.filters.map((f, i) => {
+    const vals = [].concat(f.value).map((v) => "<b>" + esc(dispValue(f.field, v)) + "</b>").join(" or ");
+    return '<span class="fpill" data-i="' + i + '"><span class="ftext">' +
+      esc(FIELD_LABEL[f.field] || f.field) + (f.op === "is_not" ? " is not " : " is ") + vals +
+      '</span><button data-x="' + i + '">&times;</button></span>';
+  }).join("");
+  host.querySelectorAll("[data-x]").forEach((b) =>
+    b.addEventListener("click", (e) => {
+      e.stopPropagation();
+      state.filters.splice(+b.dataset.x, 1);
+      resetAndLoad();
+    }));
+  host.querySelectorAll(".fpill .ftext").forEach((t) =>
+    t.addEventListener("click", () => {
+      const f = state.filters[+t.parentElement.dataset.i];
+      const kind = f && KIND_OF_FIELD[f.field];
+      if (kind) filterModal(kind);
+    }));
+}
+
+function delta(pct) {
+  if (!pct) return "";
+  const cls = pct > 0 ? "up" : "down";
+  return '<span class="d ' + cls + '">' + (pct > 0 ? "↗" : "↘") + " " + Math.abs(pct) + "%</span>";
+}
+
+async function automationModal() {
+  const site=state.site, from=state.range.from, to=state.range.to;
+  const modal=$('modal');
+  modal.innerHTML='<div class="modal automation-modal" role="dialog" aria-modal="true" aria-labelledby="automation-title"><h3 id="automation-title">Likely automated visits</h3><p>Rules apply to past and future visits. These patterns suggest automation; they are not proof. Raw events stay stored. Disable a rule to include its visits again.</p><p class="note">Site-wide results for the selected period, before report filters. Custom events or another page keep a visit included. Later activity can change a classification.</p><div id="automationerr" class="err" role="alert"></div><div id="automationrules">Loading rules…</div><div id="automationsessions"></div><div class="actions"><button class="btn" id="automationclose">Done</button></div></div>';
+  modal.classList.add('open');
+  $('automationclose').addEventListener('click',closeModal);
+  const params=new URLSearchParams({site,from,to});
+  const describe=kind=>kind==='batch'?'At least 3 visitors within 10 seconds, with similar durations':'Repeated reviewed browser profile and closely matching durations';
+  async function refresh() {
+    const response=await fetch('/api/automation?'+params);
+    if(!response.ok) throw new Error('Could not load automation rules ('+response.status+').');
+    const data=await response.json();
+    if(!modal.classList.contains('open') || !$('automationrules')) return;
+    $('automationrules').innerHTML=data.rules.length?data.rules.map(rule=>{
+      const count=data.counts.filter(c=>c.rule_id===rule.id).reduce((n,c)=>n+c.sessions,0);
+      return '<div class="automation-rule"><div><strong>'+esc(rule.network)+'</strong><div>'+esc(rule.city)+', '+esc(rule.country)+'</div><p>'+esc(describe(rule.kind))+'. Direct, homepage only, no custom events.</p><span>'+fmt(count)+' visits excluded in this period</span></div><button class="btn" data-rule="'+esc(rule.id)+'" data-enabled="'+rule.enabled+'">'+(rule.enabled?'Disable':'Enable')+'</button></div>';
+    }).join(''):'<p>No reviewed network rules for this site.</p>';
+    $('automationsessions').innerHTML='<h4>Excluded visits</h4><p class="note">Showing up to '+data.limit+' recent matches.</p>'+(data.sessions.length?data.sessions.map(s=>'<div class="automation-session"><strong>'+esc(new Date(s.first_ts*1000).toLocaleString())+'</strong><div>'+esc(s.network)+' · '+esc(s.city)+' · '+esc(duration(s.visible_ms/1000))+'</div><div>'+esc(s.reason==='network_batch'?'Network batch':'Repeated reviewed profile')+'</div><code>'+esc(s.session_id)+'</code></div>').join(''):'<p>No matching visits in this period.</p>');
+    $('automationrules').querySelectorAll('[data-rule]').forEach(button=>button.addEventListener('click',async()=>{
+      button.disabled=true; $('automationerr').textContent='';
+      try {
+        const saved=await fetch('/api/automation?'+new URLSearchParams({site}),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:button.dataset.rule,enabled:button.dataset.enabled!=='1'})});
+        if(!saved.ok) throw new Error('Could not update rule ('+saved.status+').');
+        await refresh();
+        if(state.site===site) await load();
+      } catch(error) { if($('automationerr')) $('automationerr').textContent=error.message; button.disabled=false; }
+    }));
+  }
+  try { await refresh(); } catch(error) { if($('automationerr')) $('automationerr').textContent=error.message; }
+  $('automationclose')?.focus({preventScroll:true});
+}
+
+async function revenueSettingsModal() {
+  const modal = $("modal");
+  modal.innerHTML = '<div class="modal revenue-modal" role="dialog" aria-modal="true" aria-labelledby="revenue-title"><h3 id="revenue-title">Revenue settings</h3><p>Assign a fixed amount to each event. Every matching event adds that amount to the revenue total.</p><div class="ffield"><label for="revenuecurrency">Currency for all event values</label><select class="revenue-input" id="revenuecurrency"><option value="USD">USD · US dollar</option><option value="GBP">GBP · British pound</option><option value="EUR">EUR · Euro</option><option value="CAD">CAD · Canadian dollar</option><option value="AUD">AUD · Australian dollar</option></select></div><div class="revenue-add"><div class="ffield"><label for="revenueevent">Event name</label><input class="revenue-input" id="revenueevent" maxlength="64" placeholder="purchase_basic"></div><div class="ffield"><label for="revenueamount">Amount</label><input class="revenue-input" id="revenueamount" type="number" min="0.01" step="0.01" placeholder="6.99"></div></div><div id="revenueerr" class="err" hidden></div><button class="btn primary revenue-save" id="saverule">Add revenue rule</button><div class="revenue-rules-title">Configured events</div><div id="revenuerules" class="revenue-rules"><div class="empty">Loading settings…</div></div><div class="actions"><button class="btn" id="revenueclose">Done</button></div></div>';
+  modal.classList.add("open");
+  $("revenueclose").addEventListener("click", closeModal);
+  const error = (message) => { const el = $("revenueerr"); el.textContent = message || ""; el.hidden = !message; };
+  const loadRules = async () => {
+    const res = await fetch("/api/revenue-settings?site=" + encodeURIComponent(state.site));
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Could not load revenue settings.");
+    $("revenuecurrency").value = data.currency;
+    const rules = data.rules || [];
+    $("revenuerules").innerHTML = rules.length ? rules.map(rule => '<div class="revenue-rule"><code>' + esc(rule.eventName) + '</code><strong>' + esc(money(rule.amountMinor, data.currency)) + '</strong><button class="rule-remove" type="button" data-event="' + esc(rule.eventName) + '" aria-label="Remove ' + esc(rule.eventName) + '">&times;</button></div>').join("") : '<div class="empty revenue-empty">No revenue events yet. Add an event and the amount it earns.</div>';
+    $("revenuerules").querySelectorAll("[data-event]").forEach(button => button.addEventListener("click", async () => {
+      const del = await fetch("/api/revenue-settings?site=" + encodeURIComponent(state.site) + "&event=" + encodeURIComponent(button.dataset.event), { method: "DELETE" });
+      if (!del.ok) { error("Could not remove that event rule."); return; }
+      await loadRules(); resetAndLoad();
+    }));
+  };
+  try { await loadRules(); } catch (e) { error(e.message); }
+  $("revenuecurrency").addEventListener("change", async () => {
+    const res = await fetch("/api/revenue-settings?site=" + encodeURIComponent(state.site), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ currency: $("revenuecurrency").value }) });
+    const out = await res.json(); if (!res.ok) error(out.error || "Could not save currency."); else { error(""); await loadRules(); resetAndLoad(); }
+  });
+  const save = async () => {
+    const eventName = $("revenueevent").value.trim(), amount = Number($("revenueamount").value);
+    if (!eventName || !amount) { error("Enter an event name and amount."); return; }
+    const res = await fetch("/api/revenue-settings?site=" + encodeURIComponent(state.site), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ currency: $("revenuecurrency").value, eventName, amount }) });
+    const out = await res.json(); if (!res.ok) { error(out.error || "Could not save that rule."); return; }
+    error(""); $("revenueevent").value = ""; $("revenueamount").value = ""; await loadRules(); resetAndLoad();
+  };
+  $("saverule").addEventListener("click", save);
+  $("revenueevent").addEventListener("keydown", e => { if (e.key === "Enter") save(); });
+  $("revenueamount").addEventListener("keydown", e => { if (e.key === "Enter") save(); });
+}
+
+function duration(sec) {
+  sec = Math.round(sec || 0);
+  if (sec < 60) return sec + "s";
+  const m = Math.floor(sec / 60);
+  if (m < 60) return m + "m " + (sec % 60) + "s";
+  return Math.floor(m / 60) + "h " + (m % 60) + "m";
+}
+
+function renderStats() {
+  const t = state.data.totals, d = state.data.deltas;
+  const tiles = [
+    ["visitors", "Unique visitors", fmt(t.visitors), delta(d.visitors), true],
+    ["visits", "Total visits", fmt(t.visits), delta(d.visits), true],
+    ["pageviews", "Total pageviews", fmt(t.pageviews), delta(d.pageviews), true],
+    ["revenue", "Revenue", money(t.revenueMinor || 0, state.data.currency), delta(d.revenue), true],
+    [null, "Views per visit", t.viewsPerVisit, "", false],
+    [null, "Bounce rate", t.bounceRate + "%", "", false],
+    [null, "Visit duration", duration(t.duration), "", false],
+  ];
+  $("stats").innerHTML = tiles.map(([key, label, value, dl, sel]) =>
+    '<' + (sel ? 'button type="button"' : 'div') + ' class="stat' + (sel ? " selectable" : "") + (key === state.metric ? " active" : "") + '"' +
+    (key ? ' data-metric="' + key + '" aria-pressed="' + (key === state.metric) + '"' : "") + ">" +
+    '<div class="k">' + label + '</div><div class="v tabular">' + value + dl + '</div></' + (sel ? 'button' : 'div') + '>').join("");
+  $("stats").querySelectorAll("[data-metric]").forEach((el) =>
+    el.addEventListener("click", () => {
+      state.metric = el.dataset.metric;
+      renderStats(); renderChart();
+    }));
+}
+
+/* ---- chart ---- */
+
+function renderChart() {
+  if ($("chartmetric")) $("chartmetric").textContent = ({visitors:"Unique visitors", visits:"Total visits", pageviews:"Total pageviews", revenue:"Revenue"})[state.metric];
+  const series = state.data.timeseries || [];
+  const canvas = $("chart");
+  const ratio = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight || 330;
+  canvas.width = w * ratio; canvas.height = h * ratio;
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  const key = state.metric === "visits" ? "visits" : state.metric === "pageviews" ? "pageviews" : state.metric === "revenue" ? "revenue_minor" : "v";
+  const values = series.map((p) => (state.metric === "revenue" ? (p[key] || 0) / 100 : p[key] || 0));
+
+  const padL = 44, padR = 12, padT = 14, padB = 28;
+  const plotW = w - padL - padR, plotH = h - padT - padB;
+  const max = Math.max(1, ...values);
+  const niceMax = niceCeil(max);
+  // A handful of visitors shouldn't be squashed against the bottom of an
+  // axis padded out to a round 4 — the peak should reach the top of the
+  // chart. Below that, draw exactly as many gridlines as the axis has whole
+  // units, so a max of 1 gets one line (0, 1) instead of four (with the
+  // repeated "1, 1, 1, 0" labels that scaling to 4 divisions would produce).
+  const divisions = niceMax <= 4 ? niceMax : 4;
+
+  ctx.strokeStyle = themeColor("--line");
+  ctx.fillStyle = themeColor("--mute");
+  ctx.font = "11px Inter,sans-serif";
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= divisions; i++) {
+    const y = Math.round(padT + (plotH / divisions) * i) + 0.5;
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke();
+    ctx.textAlign = "right";
+    const tick = niceMax - (niceMax / divisions) * i;
+    ctx.fillText(state.metric === "revenue" ? money(tick * 100, state.data.currency, 2) : String(Math.round(tick)), padL - 9, y + 4);
+  }
+
+  if (!values.length) {
+    ctx.textAlign = "center";
+    ctx.fillText("No data in this range", w / 2, h / 2);
+    return;
+  }
+
+  const x = (i) => padL + (values.length === 1 ? plotW / 2 : (plotW / (values.length - 1)) * i);
+  const y = (v) => padT + plotH - (v / niceMax) * plotH;
+
+  const grad = ctx.createLinearGradient(0, padT, 0, padT + plotH);
+  grad.addColorStop(0, accA(.12));
+  grad.addColorStop(1, accA(0));
+  ctx.beginPath();
+  ctx.moveTo(x(0), padT + plotH);
+  values.forEach((v, i) => ctx.lineTo(x(i), y(v)));
+  ctx.lineTo(x(values.length - 1), padT + plotH);
+  ctx.closePath();
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  ctx.beginPath();
+  values.forEach((v, i) => (i ? ctx.lineTo(x(i), y(v)) : ctx.moveTo(x(i), y(v))));
+  ctx.strokeStyle = themeColor("--accent");
+  ctx.lineWidth = 1.7;
+  ctx.lineJoin = "round";
+  ctx.stroke();
+
+  const li = values.length - 1;
+  ctx.beginPath(); ctx.arc(x(li), y(values[li]), 3.5, 0, Math.PI * 2);
+  ctx.fillStyle = themeColor("--accent"); ctx.fill();
+
+  ctx.fillStyle = themeColor("--mute");
+  ctx.textAlign = "center";
+  const markCount = Math.max(2, Math.min(6, Math.floor(w / 160)));
+  const marks = Array.from({length:markCount}, (_,i) => Math.round(li * i / (markCount - 1)));
+  new Set(marks).forEach((i) => ctx.fillText(shortDate(series[i].t), x(i), h - 9));
+  canvas.onpointermove = event => {
+    const rect = canvas.getBoundingClientRect();
+    const pointerX = event.clientX - rect.left;
+    if (pointerX < padL || pointerX > w-padR) return;
+    const index = Math.max(0,Math.min(values.length-1,Math.round((pointerX-padL)/plotW*(values.length-1))));
+    renderChart();
+    ctx.beginPath(); ctx.setLineDash([3,3]); ctx.strokeStyle=themeColor('--mute'); ctx.moveTo(x(index),padT); ctx.lineTo(x(index),h-padB); ctx.stroke(); ctx.setLineDash([]);
+    ctx.beginPath(); ctx.arc(x(index),y(values[index]),4,0,Math.PI*2); ctx.fillStyle=themeColor('--accent'); ctx.fill();
+    const tooltip=$('charttooltip');
+    tooltip.innerHTML='<strong>'+esc(series[index].t.replace('T',' · '))+' UTC</strong><span><i></i>'+esc($('chartmetric').textContent)+'<b>'+esc(state.metric === 'revenue' ? money(Math.round(values[index] * 100), state.data.currency) : fmt(values[index]))+'</b></span>';
+    tooltip.hidden=false;
+    tooltip.style.left=Math.max(8,Math.min(canvas.offsetLeft+x(index)+12,canvas.parentElement.clientWidth-220))+'px'; tooltip.style.top='28px';
+  };
+  canvas.onpointerleave=()=>{ $('charttooltip').hidden=true; renderChart(); };
+}
+
+function niceCeil(n) {
+  // Small counts use their own exact value as the axis top, so 1 visitor
+  // reaches the top of the chart instead of sitting at a quarter of a
+  // padded-out axis that goes up to 4 regardless of what actually happened.
+  if (n <= 4) return Math.max(1, Math.round(n));
+  const mag = Math.pow(10, Math.floor(Math.log10(n)));
+  return Math.ceil(n / (mag / 2)) * (mag / 2);
+}
+
+function shortDate(t) {
+  if (!t) return "";
+  if (t.includes("T")) return t.slice(11, 16);
+  const d = new Date(t + "T00:00:00Z");
+  return d.toLocaleDateString(undefined, { day: "numeric", month: "short", timeZone: "UTC" });
+}
+
+/* ---- panels ---- */
+
+function renderPanel(group, options = {}) {
+  const key = options.key || active[group];
+  const host = options.host || $(group);
+  if (!host || !state.data) return;
+  if (currentPreview()) {
+    host.innerHTML = '<div class="empty">Preview sites simulate the totals and traffic chart. Detailed reports appear on tracked websites.</div>';
+    return;
+  }
+
+  if (key === "map") {
+    host.innerHTML = '<div id="mapwrap"><canvas id="mapcanvas"></canvas></div>';
+    requestAnimationFrame(drawMap);
+    return;
+  }
+  if (key === "goals") return renderGoals(host);
+  if (key === "explore") return renderExplore(host);
+  if (key === "visits") return renderVisits(host);
+  if (key === "events") return renderEvents(host);
+
+  let list = [...(state.data[key] || [])];
+  if (options.query) list = list.filter(r => String(key === 'countries' ? countryName(r.k) : key === 'languages' ? languageName(r.k) : r.k).toLowerCase().includes(options.query.toLowerCase()));
+  list.sort((a,b) => options.sort === 'name' ? String(a.k).localeCompare(String(b.k)) : (b.v || 0) - (a.v || 0));
+  if (!options.expanded) list = list.slice(0, 9);
+  if (!list.length) {
+    host.innerHTML = '<div class="empty">Nothing recorded in this range.</div>';
+    return;
+  }
+  const label = { channels: "Channel", sources: "Source", campaigns: "Campaign",
+    pages: "Page", entry: "Entry page", exit: "Exit page",
+    countries: "Country", regions: "Region", cities: "City",
+    browsers: "Browser", os: "Operating system", devices: "Device",
+    screens: "Screen size", visitorTypes: "Visitor", networks: "Network",
+    languages: "Language", timezones: "Timezone" }[key];
+
+  const showPct = group === "tech" || group === "who";
+  const total = state.data.totals.visitors || 1;
+  const disp = key === "countries" ? countryName : key === "languages" ? languageName : null;
+  const max = Math.max(...list.map((r) => r.v || 0), 1);
+
+  host.innerHTML =
+    '<div class="thead"><span>' + label + '</span><span class="cols"><span>Visitors</span>' +
+    (showPct ? "<span>%</span>" : "") + "</span></div>" +
+    '<div class="rows">' + list.map((r) =>
+      '<div class="row" role="button" tabindex="0" data-f="' + FIELD_OF[key] + '" data-v="' + esc(r.k) + '">' +
+      '<div class="bar" style="width:' + ((r.v || 0) / max) * 100 + '%"></div>' +
+      '<span class="lbl">' + esc(disp ? disp(r.k) : r.k) + "</span>" +
+      '<span class="nums"><span class="val tabular">' + fmt(r.v) + "</span>" +
+      (showPct ? '<span class="pct tabular">' + ((r.v / total) * 100).toFixed(1) + "%</span>" : "") +
+      "</span></div>").join("") + "</div>";
+
+  host.querySelectorAll(".row").forEach((el) =>
+    el.addEventListener("click", () => {
+      const field = el.dataset.f;
+      if (!field) return;
+      if (!state.filters.some((f) => f.field === field && [].concat(f.value).includes(el.dataset.v))) {
+        if ($("modal").contains(el)) closeModal();
+        state.filters.push({ field, op: "is", value: [el.dataset.v] });
+        resetAndLoad();
+      }
+    }));
+}
+
+function expandReport(group) {
+  if (!state.data) return;
+  const key = active[group] === 'map' ? 'countries' : active[group];
+  const title = document.querySelector('.tabs[data-group="'+group+'"] [data-key="'+key+'"]')?.textContent || 'Report';
+  $('modal').classList.add('open');
+  $('modal').innerHTML='<section class="modal report-modal" role="dialog" aria-modal="true" aria-labelledby="report-title"><div class="report-title"><h3 id="report-title">'+esc(title)+'</h3><button class="report-close" id="closereport" aria-label="Close report">×</button></div><div class="report-tools"><input id="reportsearch" class="searchbox" aria-label="Search report" placeholder="Search…"><select id="reportsort" aria-label="Sort report"><option value="visitors">Most visitors</option><option value="name">Name A–Z</option></select></div><div id="expandedreport"></div><p class="note">Showing all entries available for this period. Select a row to filter the dashboard.</p></section>';
+  const refresh=()=>renderPanel(group,{host:$('expandedreport'),key,expanded:true,query:$('reportsearch').value,sort:$('reportsort').value});
+  $('closereport').addEventListener('click',closeModal);$('reportsearch').addEventListener('input',refresh);$('reportsort').addEventListener('change',refresh);refresh();$('reportsearch').focus();
+}
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape') { closeModal(); closeMenus(); }
+  if ((event.key === 'Enter' || event.key === ' ') && event.target.matches('.row[role="button"]')) { event.preventDefault(); event.target.click(); }
+  if (event.key === 'Tab' && $('modal').classList.contains('open')) {
+    const items=[...$('modal').querySelectorAll('button,input,select,[tabindex="0"]')].filter(el=>!el.disabled && el.getClientRects().length);
+    if(!items.length)return;const first=items[0],last=items[items.length-1];
+    if(event.shiftKey && document.activeElement===first){event.preventDefault();last.focus();}
+    else if(!event.shiftKey && document.activeElement===last){event.preventDefault();first.focus();}
+  }
+});
+/* ---- individual visits ---- */
+
+// ISO2 → flag emoji, no image assets needed.
+function flag(iso) {
+  if (!iso || iso.length !== 2 || !/^[A-Za-z]{2}$/.test(iso)) return "";
+  return String.fromCodePoint(...[...iso.toUpperCase()].map((c) => 0x1f1e6 + c.charCodeAt(0) - 65));
+}
+
+let LANG_NAMES = null;
+function languageName(tag) {
+  if (!tag) return tag;
+  try {
+    LANG_NAMES ||= new Intl.DisplayNames(undefined, { type: "language" });
+    return LANG_NAMES.of(tag) + " (" + tag + ")";
+  } catch { return tag; }
+}
+
+function ago(ts) {
+  const s = Math.max(0, Math.floor(Date.now() / 1000) - ts);
+  if (s < 60) return "just now";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h ago";
+  if (s < 7 * 86400) return Math.floor(s / 86400) + "d ago";
+  return new Date(ts * 1000).toLocaleDateString(undefined, { day: "numeric", month: "short" });
+}
+
+async function renderVisits(host) {
+  host.innerHTML = '<div class="empty">Loading visits…</div>';
+  const params = new URLSearchParams({
+    site: state.site, from: state.range.from, to: state.range.to,
+    filters: JSON.stringify(state.filters), limit: "50",
+  });
+  const res = await fetch("/api/visits?" + params);
+  if (!res.ok) { host.innerHTML = '<div class="empty">Could not load visits.</div>'; return; }
+  const { visits } = await res.json();
+
+  if (!visits.length) {
+    host.innerHTML = '<div class="empty">No visits in this range.</div>';
+    return;
+  }
+
+  host.innerHTML = '<div class="visits">' + visits.map((v) => {
+    const place = [v.city, v.region, countryName(v.country)].filter(Boolean).join(", ") || "Unknown location";
+    const dev = [v.browser, v.os, v.device].filter(Boolean).join(" · ");
+    const src = v.ref_domain || v.channel || "Direct";
+    const journey = v.entry === v.exit || !v.exit
+      ? esc(v.entry || "—")
+      : esc(v.entry || "—") + ' <span class="arr">→</span> ' + esc(v.exit);
+    const meta = [v.network, v.language, v.screen ? v.screen + "px" : null, v.timezone]
+      .filter(Boolean).map(esc).join(" · ");
+    return `
+      <div class="visit">
+        <div class="vtop">
+          <span class="vtag ${v.is_returning ? "ret" : "new"}">${v.is_returning ? "RETURNING" : "NEW"}</span>
+          <span class="vwhen">${esc(ago(v.started))}</span>
+          <span class="vplace">${flag(v.country)} ${esc(place)}</span>
+          <span class="vdev">${esc(dev)}</span>
+          <span class="vsrc">${esc(src)}</span>
+          <span class="vpath">${journey}</span>
+          <span class="vnums tabular">${fmt(v.pageviews)} ${v.pageviews === 1 ? "page" : "pages"} · ${duration(v.duration)}</span>
+        </div>
+        ${meta ? '<div class="vmeta">' + meta + "</div>" : ""}
+      </div>`;
+  }).join("") + "</div>" +
+  '<p class="note">The 50 most recent visits. Nothing here identifies a person — no cookie, no stored IP, no name.</p>';
+}
+
+/* ---- individual custom events + their properties ---- */
+
+function propsText(props) {
+  if (!props || typeof props !== "object") return "";
+  const keys = Object.keys(props);
+  if (!keys.length) return "";
+  return keys.map((k) => k + ": " + props[k]).join(" · ");
+}
+
+async function renderEvents(host) {
+  host.innerHTML = '<div class="empty">Loading events…</div>';
+  const params = new URLSearchParams({
+    site: state.site, from: state.range.from, to: state.range.to,
+    filters: JSON.stringify(state.filters), limit: "50",
+  });
+  const res = await fetch("/api/events?" + params);
+  if (!res.ok) { host.innerHTML = '<div class="empty">Could not load events.</div>'; return; }
+  const { events } = await res.json();
+
+  if (!events.length) {
+    host.innerHTML = '<div class="empty">No custom events yet — call stats(\'event_name\') or stats(\'event_name\', { key: value }) on your site.</div>';
+    return;
+  }
+
+  host.innerHTML = '<div class="visits">' + events.map((e) => {
+    const place = [e.city, e.region, countryName(e.country)].filter(Boolean).join(", ") || "Unknown location";
+    const dev = [e.browser, e.os, e.device].filter(Boolean).join(" · ");
+    const src = e.ref_domain || e.channel || "Direct";
+    const props = propsText(e.props);
+    return `
+      <div class="visit">
+        <div class="vtop">
+          <span class="vtag evt">${esc(e.name)}</span>
+          <span class="vwhen">${esc(ago(e.ts))}</span>
+          <span class="vplace">${flag(e.country)} ${esc(place)}</span>
+          <span class="vdev">${esc(dev)}</span>
+          <span class="vsrc">${esc(src)}</span>
+          <span class="vpath">${esc(e.path || "—")}</span>
+          <span class="vnums">${e.is_returning ? "returning" : "new"}</span>
+        </div>
+        ${props ? '<div class="vmeta">' + esc(props) + "</div>" : ""}
+      </div>`;
+  }).join("") + "</div>" +
+  '<p class="note">The 50 most recent custom events, with whatever properties they carried.</p>';
+}
+
+function renderGoals(host) {
+  const goals = state.data.goals || [];
+  if (!goals.length) {
+    host.innerHTML = '<div class="empty">No custom events yet — call stats(\'event_name\') on your site.</div>';
+    return;
+  }
+  const max = Math.max(...goals.map((g) => g.events));
+  host.innerHTML =
+    '<div class="goalhead"><span>Goal</span><span>Visitors</span><span>Events</span></div>' +
+    goals.map((g) =>
+      '<div class="goalrow"><div class="bar" style="width:' + (g.events / max) * 100 + '%"></div>' +
+      '<div class="lbl">' + esc(g.k) + "</div>" +
+      '<div class="val tabular">' + fmt(g.visitors) + "</div>" +
+      '<div class="val tabular">' + fmt(g.events) + "</div></div>").join("");
+}
+
+/* ---- explore (user journeys) ---- */
+
+function renderExplore(host) {
+  const starts = [
+    ...(state.data.pages || []).map((p) => ({ k: p.k, v: p.v })),
+    ...(state.data.goals || []).map((g) => ({ k: g.k, v: g.events })),
+  ].sort((a, b) => b.v - a.v).slice(0, 12);
+
+  host.innerHTML = `
+    <div class="explore">
+      <div class="excol"><h4>Starting point</h4><div class="frame" id="exstart"></div></div>
+      <div class="excol"><h4>1 step after</h4><div class="frame" id="exs1">
+        <div class="exempty">▷<br>Select a starting point to continue</div></div></div>
+      <div class="excol"><h4>2 steps after</h4><div class="frame" id="exs2">
+        <div class="exempty">▷<br>Select a starting point to continue</div></div></div>
+    </div>`;
+
+  const startHost = $("exstart");
+  if (!starts.length) {
+    startHost.innerHTML = '<div class="exempty">No activity in this range yet.</div>';
+    return;
+  }
+  const max = Math.max(...starts.map((s) => s.v), 1);
+  startHost.innerHTML = starts.map((s) =>
+    '<div class="exrow' + (s.k === state.journeyStart ? " on" : "") + '" data-s="' + esc(s.k) + '">' +
+    '<div class="bar" style="width:' + (s.v / max) * 100 + '%"></div>' +
+    '<span class="lbl">' + esc(s.k) + '</span><span class="val tabular">' + fmt(s.v) + "</span></div>").join("");
+
+  startHost.querySelectorAll(".exrow").forEach((el) =>
+    el.addEventListener("click", () => loadJourney(el.dataset.s)));
+
+  if (state.journeyStart) loadJourney(state.journeyStart, true);
+}
+
+async function loadJourney(start, silent) {
+  state.journeyStart = start;
+  document.querySelectorAll("#exstart .exrow").forEach((el) =>
+    el.classList.toggle("on", el.dataset.s === start));
+  if (!silent) {
+    $("exs1").innerHTML = '<div class="exempty">Loading…</div>';
+    $("exs2").innerHTML = '<div class="exempty">Loading…</div>';
+  }
+  const params = new URLSearchParams({
+    site: state.site, from: state.range.from, to: state.range.to,
+    filters: JSON.stringify(state.filters), start,
+  });
+  const res = await fetch("/api/journey?" + params);
+  if (!res.ok) return;
+  const j = await res.json();
+  fillJourneyCol($("exs1"), j.step1);
+  fillJourneyCol($("exs2"), j.step2);
+}
+
+function fillJourneyCol(host, list) {
+  if (!list || !list.length) {
+    host.innerHTML = '<div class="exempty">Sessions end here.</div>';
+    return;
+  }
+  const max = Math.max(...list.map((r) => r.v), 1);
+  host.innerHTML = list.map((r) =>
+    '<div class="exrow"><div class="bar" style="width:' + (r.v / max) * 100 + '%"></div>' +
+    '<span class="lbl">' + esc(r.k) + '</span><span class="val tabular">' + fmt(r.v) + "</span></div>").join("");
+}
+
+/* ---- world map ---- */
+
+const MAP_W = 1000, MAP_H = 500;
+let mapPaths = null;
+let mapScale = 1;
+
+function buildPaths() {
+  mapPaths = {};
+  for (const iso in WORLD) {
+    const path = new Path2D();
+    for (const ring of WORLD[iso].r) {
+      path.moveTo(ring[0], ring[1]);
+      for (let i = 2; i < ring.length; i += 2) path.lineTo(ring[i], ring[i + 1]);
+      path.closePath();
+    }
+    mapPaths[iso] = path;
+  }
+}
+
+function countryName(iso) {
+  return (WORLD[iso] && WORLD[iso].n) || iso;
+}
+
+function visitorsByCountry() {
+  const out = {};
+  for (const row of state.data.countries || []) out[row.k] = row.v;
+  return out;
+}
+
+function drawMap() {
+  const canvas = $("mapcanvas");
+  if (!canvas) return;
+  if (!mapPaths) buildPaths();
+
+  const counts = visitorsByCountry();
+  const max = Math.max(1, ...Object.values(counts));
+
+  const ratio = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth || canvas.parentElement.clientWidth;
+  const h = w * (MAP_H / MAP_W);
+  canvas.style.height = h + "px";
+  canvas.width = w * ratio;
+  canvas.height = h * ratio;
+
+  mapScale = w / MAP_W;
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(ratio * mapScale, 0, 0, ratio * mapScale, 0, 0);
+  ctx.clearRect(0, 0, MAP_W, MAP_H);
+
+  ctx.lineWidth = 0.8 / mapScale;
+  ctx.strokeStyle = themeColor("--card");
+
+  for (const iso in mapPaths) {
+    const v = counts[iso] || 0;
+    if (v) {
+      const t = 0.3 + 0.7 * Math.sqrt(v / max);
+      ctx.fillStyle = accA(t.toFixed(3));
+    } else {
+      ctx.fillStyle = themeColor("--map-empty");
+    }
+    ctx.fill(mapPaths[iso]);
+    ctx.stroke(mapPaths[iso]);
+  }
+}
+
+function countryAt(canvas, clientX, clientY) {
+  if (!mapPaths) return null;
+  const rect = canvas.getBoundingClientRect();
+  const x = (clientX - rect.left) / mapScale;
+  const y = (clientY - rect.top) / mapScale;
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  for (const iso in mapPaths) {
+    if (ctx.isPointInPath(mapPaths[iso], x, y)) return iso;
+  }
+  return null;
+}
+
+const tip = document.createElement("div");
+tip.className = "maptip";
+document.body.appendChild(tip);
+
+document.addEventListener("mousemove", (e) => {
+  const canvas = $("mapcanvas");
+  if (!canvas || !state.data || e.target !== canvas) { tip.style.display = "none"; return; }
+  const iso = countryAt(canvas, e.clientX, e.clientY);
+  if (!iso) { tip.style.display = "none"; canvas.style.cursor = "default"; return; }
+  const v = visitorsByCountry()[iso] || 0;
+  tip.innerHTML = "<b>" + esc(countryName(iso)) + "</b>" + fmt(v) + (v === 1 ? " visitor" : " visitors");
+  tip.style.display = "block";
+  tip.style.left = e.clientX + 14 + "px";
+  tip.style.top = e.clientY + 14 + "px";
+  canvas.style.cursor = "pointer";
+});
+
+document.addEventListener("click", (e) => {
+  const canvas = $("mapcanvas");
+  if (!canvas || e.target !== canvas) return;
+  const iso = countryAt(canvas, e.clientX, e.clientY);
+  if (!iso || !(visitorsByCountry()[iso] > 0)) return;
+  if (!state.filters.some((f) => f.field === "country" && [].concat(f.value).includes(iso))) {
+    state.filters.push({ field: "country", op: "is", value: [iso] });
+    resetAndLoad();
+  }
+});
+
+/* ---- shortcuts: "/" focuses site search on the index ---- */
+document.addEventListener("keydown", (e) => {
+  if (e.key === "/" && !state.site && !/INPUT|TEXTAREA/.test(e.target.tagName)) {
+    e.preventDefault();
+    const s = $("sitesearch");
+    if (s) s.focus();
+  }
+});
+
+window.addEventListener("resize", () => {
+  if (state.site && state.data) { renderChart(); drawMap(); }
+});
+
+route();
+</script>
+</body>
+</html>

@@ -1,0 +1,50 @@
+name = "lucid-analytics"
+main = "src/worker.js"
+# Set these values for your own Cloudflare account and database before deploy.
+account_id = "YOUR_CLOUDFLARE_ACCOUNT_ID"
+compatibility_date = "2026-08-01"
+
+# Dashboard UI + tracker.js are served from ./public
+#
+# run_worker_first is REQUIRED. Without it Cloudflare serves matching files
+# straight from ./public and the Worker never runs — which would publish the
+# dashboard to anyone who knows the URL, password or not. With it on, every
+# request goes through src/worker.js, and only /tracker.js is let through
+# unauthenticated.
+[assets]
+directory = "./public"
+binding = "ASSETS"
+run_worker_first = true
+
+# D1 database holding every event.
+# Create it once:   npx wrangler d1 create analytics
+# then paste the returned database_id below.
+[[d1_databases]]
+binding = "DB"
+database_name = "lucid-analytics"
+database_id = "YOUR_D1_DATABASE_ID"
+
+[vars]
+# Sites allowed to send events. Anything not listed is rejected, so a
+# stranger who finds the endpoint can't pollute your numbers.
+ALLOWED_SITES = ""
+
+# Excluded places (countries/regions/cities dropped at ingest) are no longer
+# configured here — they live in the D1 `excluded` table and are managed from
+# the dashboard itself (⚙ Excluded Places), taking effect within 60s with no
+# redeploy needed. See schema.sql / migrations/003-fresh-start-no-imports.sql.
+
+# Set to "1" to allow http://localhost origins while testing.
+ALLOW_LOCAL_DEV = "0"
+
+# SECRETS — never commit these. Set them with:
+#
+#   npx wrangler secret put DASH_PASSWORD
+#     Password for the dashboard (username is anything). This is the only
+#     thing standing between the internet and your stats — make it long.
+#
+#   npx wrangler secret put ID_SALT
+#     Random string used to hash visitor IDs. Generate with:
+#       openssl rand -hex 32
+#     Changing it resets visitor identity (old data stays, but returning
+#     visitors will look new from that point on).

@@ -1,0 +1,14 @@
+.wrangler/
+node_modules/
+.dev.vars
+plausible-import.sql
+.dash-password.txt
+.DS_Store
+
+# Local deployment and analytics records; do not publish site-specific data.
+/work/
+/BOT-FILTERING.md
+/migrations/007-*.sql
+/migrations/009-*.sql
+/scripts/test-historical-batch.mjs
+/scripts/undo-*.sql
