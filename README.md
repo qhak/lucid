@@ -43,6 +43,22 @@ The project is designed to avoid cookie-based tracking; that alone does not dete
 - Static HTML, CSS and JavaScript for the dashboard and tracking script
 - Wrangler for local development and deployment
 
+## Run the regression tests
+
+Use Node.js 22.13 or later. The tests use Node's built-in `node:sqlite` module
+and do not need a Cloudflare account or deployed database.
+
+Run the checks from the repository root:
+
+```bash
+node scripts/test-event-validation.mjs
+node scripts/test-automation.mjs
+node scripts/test-automation-api.mjs
+```
+
+The automation tests create temporary in-memory SQLite databases; they do not
+read or modify a deployed Lucid database.
+
 ## Run your own instance
 
 Lucid is built around Cloudflare Workers and D1. To create a separate instance:
